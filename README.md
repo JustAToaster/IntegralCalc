@@ -2,8 +2,11 @@
 Definite integration on GPU (up to triple integrals). Made as a GPU programming project for University.
 ## Compiling
 For Linux, install the OpenCL SDK:
+
 **sudo apt-get install ocl-icd-opencl-dev**
+
 And an OpenCL platform:
+
 - **sudo apt-get install beignet-opencl-icd** for Intel iGPUs
 - **sudo apt-get install nvidia-opencl-icd** for NVIDIA GPUs
 - **sudo apt-get install mesa-opencl-icd** for AMD GPUs
