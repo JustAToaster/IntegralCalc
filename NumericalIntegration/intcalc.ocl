@@ -1,0 +1,77 @@
+//Function to integrate
+inline float4 function(float4 x){
+	return 
+		log(1+x)/x;
+}
+
+inline float function1(float x){
+	return 
+		log(1+x)/x;
+}
+
+inline float2 function2(float2 x){
+	return 
+		sqrt(1-x*x);
+}
+
+kernel void intcalc_simpson(global float4 * values, float leftLimit, float dist){
+
+	const int i = get_global_id(0);
+	float x1 = leftLimit + ((i<<2)+1)*dist;
+	float x2 = x1+dist;
+	float x3 = x2+dist;
+	float x4 = x3+dist;
+	//printf("x1: %f, x2: %f, x3: %f, x4: %f\n", x1, x2, x3, x4);
+	values[i] = (float4)(4.0f,2.0f,4.0f,2.0f)*function((float4)(x1,x2,x3,x4));
+
+}
+
+kernel void intcalc_trap(global float4 * funcValues, float leftLimit, float height){
+
+	const int i = get_global_id(0);
+	float x1 = leftLimit + (i<<2)*height;
+	float x2 = x1+height;
+	float x3 = x2+height;
+	float x4 = x3+height;
+	float4 f = function((float4)(x1,x2,x3,x4));
+	funcValues[i] = (float4)(f.s0+f.s1,f.s1+f.s2, f.s2+f.s3, f.s3+function1(x4+height));
+
+}
+
+kernel void intcalc_rect(global float4 * funcValues, float leftLimit, float base){
+
+	const int i = get_global_id(0);
+	float x1 = leftLimit + (i<<2)*base;
+	float x2 = x1+base;
+	float x3 = x2+base;
+	float x4 = x3+base;
+	funcValues[i] = function((float4)(x1,x2,x3,x4));
+
+}
+
+//Sum reduction with local memory
+kernel void reduce4_lmem(global float * restrict out,
+	global const float4 * restrict in, local float * lmem, int nquarts)
+{
+	const int gws = get_global_size(0);
+	int i = get_global_id(0);
+	float acc = 0.0f;
+	while (i < nquarts) {
+		float4 v = in[i];
+		acc += (v.x + v.y) + (v.z + v.w);
+		i += gws;
+	}
+	i = get_local_id(0);
+	lmem[i] = acc;
+	int working = get_local_size(0)/2;
+	while (working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if(i < working){
+			acc += lmem[i+working];
+			lmem[i] = acc;
+		}
+		working /= 2;
+	}
+	if (i == 0) out[get_group_id(0)] = acc;
+}
+

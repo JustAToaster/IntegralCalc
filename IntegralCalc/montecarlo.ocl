@@ -1,0 +1,173 @@
+//Function to integrate
+inline float4 function(float4 x){
+	return
+		log(1+x)/x;
+}
+
+inline float2 function2(float2 x){
+	return 
+		log(1+x)/x;
+}
+
+inline float function1(float x){
+	return 
+		log(1+x)/x;
+}
+
+//MWC64x, an RNG made by David B. Tomas, with custom seeding
+//Source: http://cas.ee.ic.ac.uk/people/dt10/research/rngs-gpu-mwc64x.html
+
+typedef struct{ uint4 x; uint4 c; } mwc64xvec4_state_t;
+
+inline float4 MWC64XVEC4(mwc64xvec4_state_t *s, float leftLimit, float rightLimit)
+{
+    enum{ MWC64XVEC4_A = 4294883355U };
+    uint4 x=s->x, c=s->c;
+    uint4 res=x^c;                     // Calculate the result
+    uint4 hi=mul_hi(x,MWC64XVEC4_A);              // Step the RNG
+    x=x*MWC64XVEC4_A+c;
+    c=hi+convert_uint4(x<c);
+    s->x=x;
+    s->c=c;             // Pack the state back up
+    return leftLimit + convert_float4(res)*((rightLimit - leftLimit)/4294967295);
+}
+
+//Another simple RNG (often used in hashing) to randomize local id or global id
+inline uint randomizeId(uint id)
+{
+        id = (id ^ 61) ^ (id >> 16);
+        id *= 9;
+        id = id ^ (id >> 4);
+        id *= 0x27d4eb2d;
+        id = id ^ (id >> 15);
+        return id;
+ }
+
+//Mix seeds with randomized global id and local id
+inline void MWC64XVEC4_Seeding(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const int gi = get_global_id(0) + 1;
+	const int li = get_local_id(0) + 1;
+	s->x = (uint4)((seed1) ^ randomizeId(gi&li), (seed2*seed3) ^ randomizeId(gi&li), (seed2*(seed4 & 131071)) ^ randomizeId(gi+li), ((seed1 & 131071)*seed2) ^ randomizeId(gi+li));
+	s->c = (uint4)((seed4) ^ randomizeId(gi+li), (seed4 ^ seed1) ^ randomizeId(gi+li), (seed3*seed1) ^ randomizeId(gi & li), (seed3*(seed4 & 131071)) ^ randomizeId(gi & li));
+}
+
+//Each work-item deals with a float4 and computes the function values for each component and its antithetic
+//Then saves the results of the sum, to save time and space
+kernel void montecarlo_mean(global float4 * sum, float leftLimit, float rightLimit, uint seed1, uint seed2, uint seed3, uint seed4)
+{
+
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	float4 funcValue1 = function(x);
+	float4 funcValue2 = function(leftLimit + rightLimit - x);
+	sum[get_global_id(0)] = funcValue1+funcValue2;
+	
+}
+
+//Sum reduction with local memory
+kernel void reduce4_lmem(global float * restrict out,
+	global const float4 * restrict in, local float * lmem, int nquarts)
+{
+	const int gws = get_global_size(0);
+	int i = get_global_id(0);
+	float acc = 0.0f;
+	while (i < nquarts) {
+		float4 v = in[i];
+		acc += (v.x + v.y) + (v.z + v.w);
+		i += gws;
+	}
+	i = get_local_id(0);
+	lmem[i] = acc;
+	int working = get_local_size(0)/2;
+	while (working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if(i < working){
+			acc += lmem[i+working];
+			lmem[i] = acc;
+		}
+		working /= 2;
+	}
+	if (i == 0) out[get_group_id(0)] = acc;
+}
+
+//Each work-item retrieves 2 uniformly distributed coordinates in [leftLimit, rightLimit] and computes the function value
+kernel void funcSamples4(global float4 * v, float leftLimit, float dist){
+	
+	const int i = get_global_id(0);
+	float x1 = leftLimit + (i<<1)*dist;
+	float x2 = x1+dist;
+	float2 f = function2((float2)(x1,x2));
+	v[i] = (float4)(x1, f.s0, x2, f.s1);
+
+}
+
+//Max reduction with local memory
+kernel void reduceMax_lmem(global float4 * v1, global float2 * v2,
+	local float2 * lmem){
+
+	float4 points = v1[get_global_id(0)];
+	float2 lmax, lval;
+	if(points.y > points.w) lmax=points.lo;	//Compare the two function values retrieved by the work-items, then save the highest point
+	else lmax=points.hi;
+
+	const int i = get_local_id(0);
+	lmem[i] = lmax;
+	int working = get_local_size(0) >> 1;
+	while(working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (i < working) {
+			lval = lmem[i+working];
+			if(lmax.y<lval.y){
+				lmax = lval;
+				lmem[i] = lmax;
+			}
+		}
+		working >>= 1;
+	}
+	if (i == 0)	v2[get_group_id(0)] = lmax;
+
+}
+
+//Each work-item deals with 4 points and their "antithetics"
+//Checks if the point is inside the area of the grid
+kernel void montecarlo_hit(global int * hits, float leftLimit, float rightLimit, float funcMax, uint seed1, uint seed2, uint seed3, uint seed4){
+
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	float4 y1 = MWC64XVEC4(&rng, 0, funcMax);
+	float4 y2 = MWC64XVEC4(&rng, 0, funcMax);
+
+	int4 check1 = -(function(x) >= y1);
+	int4 check2 = -(function(leftLimit+rightLimit-x) >= y2);
+	int partHits = check1.x + check1.y + check1.z + check1.w +
+				check2.x + check2.y + check2.z + check2.w;
+	atomic_add(hits, partHits);
+}
+
+//Kernel with an atomic increment for each hit
+kernel void montecarlo_hit_inc(global int * hits, float leftLimit, float rightLimit, float funcMax, uint seed1, uint seed2, uint seed3, uint seed4){
+
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	float4 y1 = MWC64XVEC4(&rng, 0, funcMax);
+	float4 y2 = MWC64XVEC4(&rng, 0, funcMax);
+
+	int4 check1 = -(function(x) >= y1);
+	int4 check2 = -(function(leftLimit+rightLimit-x) >= y2);
+	if(check1.x) atomic_inc(hits);
+	if(check1.y) atomic_inc(hits);
+	if(check1.z) atomic_inc(hits);
+	if(check1.w) atomic_inc(hits);
+	if(check2.x) atomic_inc(hits);
+	if(check2.y) atomic_inc(hits);
+	if(check2.z) atomic_inc(hits);
+	if(check2.w) atomic_inc(hits);
+
+}
+
+
+
+

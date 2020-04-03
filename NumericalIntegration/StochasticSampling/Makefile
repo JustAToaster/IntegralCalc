@@ -1,0 +1,6 @@
+LDLIBS=-lm -lOpenCL -Wall
+#LDLIBS=-framework OpenCL
+
+TARGETS = integralcalc_randrect integralcalc_randrect_lmem  integralcalc_randrect4  integralcalc_randhyperrect
+
+all: $(TARGETS)

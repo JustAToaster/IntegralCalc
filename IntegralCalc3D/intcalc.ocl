@@ -1,0 +1,273 @@
+//Function to integrate
+inline float4 function(float4 x, float4 y){
+	return
+		x*sin(y);
+}
+
+inline float function1(float x, float y){
+	return 
+		x*sin(y);
+}
+
+//MWC64x, an RNG made by David B. Tomas, with custom seeding
+//Source: http://cas.ee.ic.ac.uk/people/dt10/research/rngs-gpu-mwc64x.html
+
+typedef struct{ uint4 x; uint4 c; } mwc64xvec4_state_t;
+
+inline float4 MWC64XVEC4(mwc64xvec4_state_t *s, float leftLimit, float rightLimit)
+{
+    enum{ MWC64XVEC4_A = 4294883355U };
+    uint4 x=s->x, c=s->c;
+    uint4 res=x^c;                     // Calculate the result
+    uint4 hi=mul_hi(x,MWC64XVEC4_A);              // Step the RNG
+    x=x*MWC64XVEC4_A+c;
+    c=hi+convert_uint4(x<c);
+    s->x=x;
+    s->c=c;             // Pack the state back up
+    return leftLimit + convert_float4(res)*((rightLimit - leftLimit)/4294967295);
+}
+
+//Another simple RNG (often used in hashing) to randomize local id or global id
+inline uint randomizeId(uint id)
+{
+        id = (id ^ 61) ^ (id >> 16);
+        id *= 9;
+        id = id ^ (id >> 4);
+        id *= 0x27d4eb2d;
+        id = id ^ (id >> 15);
+        return id;
+ }
+
+//Mix seeds with randomized global id and local id
+inline void MWC64XVEC4_Seeding(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const int gi = get_global_id(0) + 1;
+	const int li = get_local_id(0) + 1;
+	s->x = (uint4)((seed1) ^ randomizeId(gi&li), (seed2*seed3) ^ randomizeId(gi&li), (seed2*(seed4 & 131071)) ^ randomizeId(gi+li), ((seed1 & 131071)*seed2) ^ randomizeId(gi+li));
+	s->c = (uint4)((seed4) ^ randomizeId(gi+li), (seed4 ^ seed1) ^ randomizeId(gi+li), (seed3*seed1) ^ randomizeId(gi & li), (seed3*(seed4 & 131071)) ^ randomizeId(gi & li));
+}
+
+inline uint xorshift(uint seed1, uint seed2, uint gi, uint li){
+	uint seed = li + gi - seed1;
+	uint t = seed ^ (seed << 11) ^seed2;  
+	return (seed2 ^ li ^ (li >> 19) ^ (t ^ (t >> 8)));
+}
+
+//Not so great seeding with Sawtooth-like behavior
+inline void MWC64XVEC4_SeedingMeh(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const uint gi = get_global_id(0) + 1;
+	const uint li = get_local_id(0) + 1;
+	s->x = (uint4)(gi*seed2+li*(seed1 & 134217727)+gi, gi*(seed4 << 3)+li, (seed3+li*(seed1 & 134217727))+gi, (seed2+li*(seed4 & 134217727))+gi);
+	//printf("state x: %u, %u, %u, %u\n", s->x.x, s->x.y, s->x.z, s->x.w);
+	s->c = (uint4)((gi*(seed3>>2)+li*(seed4 & 134217727)+gi), ((seed2+li*(seed4 & 134217727))+gi)>>1, (li*(seed3<<2) ^ (seed4 & 134217727))+gi, ((seed1 & 134217727) + li*(seed3<<3))+gi);
+	//printf("state c: %u, %u, %u, %u\n", s->c.x, s->c.y, s->c.z, s->c.w);
+}
+
+//Another bad old attempt at seeding
+inline void MWC64XVEC4_SeedingXOR(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const uint gi = get_global_id(0);
+	const uint li = get_local_id(0);
+	s->x = (uint4)(xorshift(seed1, seed2, gi, li), xorshift(seed1, seed3, gi, li), xorshift(seed1, seed4, gi, li), xorshift(seed4, seed1, gi, li));
+	s->c = (uint4)(xorshift(seed3, seed4, gi, li), xorshift(seed2, seed4, gi, li), xorshift(seed2, seed3, gi, li), xorshift(seed3, seed2, gi, li));
+}
+
+
+//Each work-item deals with two float4 and computes the function values for each component and its antithetic
+//Then saves the results of the sum, to save time and space
+kernel void montecarlo_mean(global float4 * sum, float leftLimitX, float rightLimitX, 
+	float leftLimitY, float rightLimitY, uint seed1, uint seed2, uint seed3, uint seed4)
+{
+
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x = MWC64XVEC4(&rng, leftLimitX, rightLimitX);
+	float4 y = MWC64XVEC4(&rng, leftLimitY, rightLimitY);
+	float4 funcValue1 = function(x, y);
+	float4 funcValue2 = function(leftLimitX + rightLimitX - x, leftLimitY + rightLimitY - y);
+	sum[get_global_id(0)] = funcValue1+funcValue2;
+	
+}
+
+//Each work-item retrieves 1 uniformly distributed point in the integration rectangle and computes the function value
+kernel void funcSamples3D(global float4 * v, float leftLimitX, float leftLimitY, 
+	float offX, float offY){
+	
+	//2D launch grid indexes
+	const int i = get_global_id(0);
+	const int j = get_global_id(1);
+	const int sizeY = get_global_size(1);
+
+	//Edges coordinates of the mini-rectangles that make up the whole integration rectangle
+	float x = leftLimitX + i*offX;
+	float y = leftLimitY + j*offY;
+	
+	v[j*sizeY+i] = (float4)(x, y, 0.0f, function1(x, y));
+
+}
+
+kernel void reduceMax_lmem_verbose(global float8 * v1, global float4 * v2,
+	local float4 * lmem){
+	float8 points = v1[get_global_id(0)];
+	float4 lmax;
+	if(points.s2 > points.s6) lmax=(float4)(points.s0, points.s1, points.s2, points.s3);
+	else lmax=(float4)(points.s4, points.s5, points.s6, points.s7);
+		printf("Wi %d, ho scritto lmax: (%f,%f,%f,%f)\n", get_global_id(0), lmax.x, lmax.y, lmax.z, lmax.w);
+
+
+	const int i = get_local_id(0);
+	lmem[i] = lmax;
+	int working = get_local_size(0) >> 1;
+	while(working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (i < working) {
+			if(lmax.z<lmem[i+working].z){
+				lmax = lmem[i+working];
+				lmem[i] = lmax;
+			}
+		}
+		working >>= 1;
+	}
+	if (i == 0){
+		v2[get_group_id(0)] = lmax;
+		printf("Capo %d, ho scritto lmax: (%f,%f,%f,%f)\n", get_group_id(0), lmax.x, lmax.y, lmax.z, lmax.w);
+	}
+
+}
+
+//Max reduction with local memory
+kernel void reduceMax_lmem(global float4 * v1, global float4 * v2,
+	local float4 * lmem){
+
+	const int gi = get_global_id(0);
+	float4 point1 = v1[gi];
+	float4 point2 = v1[gi + get_global_size(0)];
+
+	float4 lmax, lval;
+	if(point1.s3 > point2.s3) lmax=point1;
+	else lmax=point2;
+
+	const int i = get_local_id(0);
+	lmem[i] = lmax;
+	int working = get_local_size(0) >> 1;
+	while(working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (i < working) {
+			lval = lmem[i+working];
+			if(lmax.w<lval.w){
+				lmax = lval;
+				lmem[i] = lmax;
+			}
+		}
+		working >>= 1;
+	}
+	if (i == 0)	v2[get_group_id(0)] = lmax;
+
+}
+
+//Max reduction with local memory, fetching a float8 instead of two float4 with stride
+kernel void reduceMax8_lmem(global float8 * v1, global float4 * v2,
+	local float4 * lmem){
+	float8 points = v1[get_global_id(0)];
+	float4 lmax, lval;
+	if(points.s2 > points.s6) lmax=points.lo;
+	else lmax=points.hi;
+
+	const int i = get_local_id(0);
+	lmem[i] = lmax;
+	int working = get_local_size(0) >> 1;
+	while(working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (i < working) {
+			lval = lmem[i+working];
+			if(lmax.z<lval.w){
+				lmax = lval;
+				lmem[i] = lmax;
+			}
+		}
+		working >>= 1;
+	}
+	if (i == 0)	v2[get_group_id(0)] = lmax;
+
+}
+
+//Each work-item deals with 4 points and their "antithetics"
+//Checks if the point is inside the volume of the grid
+kernel void montecarlo_hit(global int * hits, float leftLimitX, float rightLimitX, 
+	float leftLimitY, float rightLimitY, float funcMax, uint seed1, uint seed2, uint seed3, uint seed4){
+
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x = MWC64XVEC4(&rng, leftLimitX, rightLimitX);
+	float4 y = MWC64XVEC4(&rng, leftLimitY, rightLimitY);
+	float4 z1 = MWC64XVEC4(&rng, 0, funcMax);
+	float4 z2 = MWC64XVEC4(&rng, 0, funcMax);
+
+	int4 check1 = -(function(x, y) >= z1);
+	int4 check2 = -(function(leftLimitX+rightLimitX-x, leftLimitY+rightLimitY-y) >= z2);
+	int partHits = check1.x + check1.y + check1.z + check1.w +
+				check2.x + check2.y + check2.z + check2.w;
+	atomic_add(hits, partHits);
+
+}
+
+//Each work-item deals with 4 cuboids of height f(xi,yj) for each couple (i,j) with i!=j
+kernel void intcalc_cuboids(global float4 * funcValues, float leftLimitX, float leftLimitY, 
+	float offX, float offY){
+
+	const int i = get_global_id(0);
+	const int j = get_global_id(1);
+	const int sizeY = get_global_size(1);
+	float x1 = leftLimitX + (i<<1)*offX;
+	float x2 = x1+offX;
+	float y1 = leftLimitY + (j<<1)*offY;
+	float y2 = y1+offY;
+	funcValues[j*sizeY+i] = function((float4)(x1,x1,x2,x2), (float4)(y1,y2,y1,y2));
+
+}
+
+//Each work-item deals with 4 cuboids, this time the height is the function value in
+//the middle point of each sample rectangle. Generally more accurate
+kernel void intcalc_cuboids_midpoint(global float4 * volumes, float leftLimitX, float leftLimitY, 
+	float offX, float offY){
+
+	//2D launch grid indexes
+	const int i = get_global_id(0);
+	const int j = get_global_id(1);
+	const int sizeY = get_global_size(1);
+
+	//Central coordinates of the rectangles that make up the integration rectangle
+	float x1 = leftLimitX + (i<<1)*offX + offX/2;
+	float x2 = x1+offX;
+	float y1 = leftLimitY + (j<<1)*offY + offY/2;
+	float y2 = y1+offY;
+	
+	//We can get the 4 points from all the possible combinations, (x1, y1), (x1, y2), (x2, y1), (x2, y2)
+	volumes[j*sizeY+i] = offX*offY*function((float4)(x1,x1,x2,x2), (float4)(y1,y2,y1,y2));
+
+}
+
+//Sum reduction with local memory
+kernel void reduce4_lmem(global float * restrict out,
+	global const float4 * restrict in, local float * lmem, int nquarts)
+{
+	const int gws = get_global_size(0);
+	int i = get_global_id(0);
+	float acc = 0.0f;
+	while (i < nquarts) {
+		float4 v = in[i];
+		acc += (v.x + v.y) + (v.z + v.w);
+		i += gws;
+	}
+	i = get_local_id(0);
+	lmem[i] = acc;
+	int working = get_local_size(0)/2;
+	while (working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if(i < working){
+			acc += lmem[i+working];
+			lmem[i] = acc;
+		}
+		working /= 2;
+	}
+	if (i == 0) out[get_group_id(0)] = acc;
+}
+

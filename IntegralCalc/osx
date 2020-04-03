@@ -1,0 +1,5 @@
+LDLIBS=-framework OpenCL
+
+TARGETS = integralcalc_hit	integralcalc_mean
+
+all: $(TARGETS)

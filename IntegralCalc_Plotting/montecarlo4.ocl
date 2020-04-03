@@ -1,0 +1,284 @@
+//Funzione da integrare
+inline float4 function(float4 x){
+	return
+		exp(-x*x);
+}
+
+inline float2 function2(float2 x){
+	return 
+		exp(-x*x);
+}
+
+inline float function1(float x){
+	return 
+		exp(-x*x);
+}
+
+//Algoritmo MWC64x per la generazione di numeri casuali su GPU di David B. Tomas
+//Sorgente: http://cas.ee.ic.ac.uk/people/dt10/research/rngs-gpu-mwc64x.html
+
+typedef struct{ uint4 x; uint4 c; } mwc64xvec4_state_t;
+
+inline float4 MWC64XVEC4(mwc64xvec4_state_t *s, float leftLimit, float rightLimit)
+{
+    enum{ MWC64XVEC4_A = 4294883355U };
+    uint4 x=s->x, c=s->c;
+    uint4 res=x^c;                     // Calculate the result
+    uint4 hi=mul_hi(x,MWC64XVEC4_A);              // Step the RNG
+    x=x*MWC64XVEC4_A+c;
+    c=hi+convert_uint4(x<c);
+    s->x=x;
+    s->c=c;             // Pack the state back up
+    return leftLimit + convert_float4(res)*((rightLimit - leftLimit)/4294967295);
+}
+
+inline uint randomizeId(uint id)
+{
+        id = (id ^ 61) ^ (id >> 16);
+        id *= 9;
+        id = id ^ (id >> 4);
+        id *= 0x27d4eb2d;
+        id = id ^ (id >> 15);
+        return id;
+ }
+
+inline void MWC64XVEC4_Seeding(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const int gi = get_global_id(0) + 1;
+	const int li = get_local_id(0) + 1;
+	s->x = (uint4)((seed1) ^ randomizeId(gi&li), (seed2*seed3) ^ randomizeId(gi&li), (seed2*(seed4 & 131071)) ^ randomizeId(gi+li), ((seed1 & 131071)*seed2) ^ randomizeId(gi+li));
+	s->c = (uint4)((seed4) ^ randomizeId(gi+li), (seed4 ^ seed1) ^ randomizeId(gi+li), (seed3*seed1) ^ randomizeId(gi & li), (seed3*(seed4 & 131071)) ^ randomizeId(gi & li));
+}
+
+//Ogni work-item prende 2 campioni su n distribuiti uniformemente nell'intervallo [leftLimit, rightLimit]
+kernel void funcSamples4(global float4 * v, float leftLimit, float dist){
+	
+	const int i = get_global_id(0);
+	float x1 = leftLimit + (i<<1)*dist;
+	float x2 = x1+dist;
+	float2 f = function2((float2)(x1,x2));
+	//printf("Wi %d, x1=%f, f1=%f, x2=%f, f2=%f\n", i, x1, f.x, x2, f.y);
+	v[i] = (float4)(x1, f.s0, x2, f.s1);
+
+}
+
+kernel void reduceMax_lmem(global float4 * v1, global float2 * v2,
+	local float2 * lmem){
+
+	float4 points = v1[get_global_id(0)];
+	float2 lmax;
+	if(points.y > points.w) lmax=points.lo;
+	else lmax=points.hi;
+
+	const int i = get_local_id(0);
+	lmem[i] = lmax;
+	int working = get_local_size(0) >> 1;
+	while(working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if (i < working) {
+			if(lmax.y<lmem[i+working].y){
+				lmax = lmem[i+working];
+				lmem[i] = lmax;
+			}
+		}
+		working >>= 1;
+	}
+	if (i == 0)	v2[get_group_id(0)] = lmax;
+
+}
+
+//Inizializzazione immagine bianca (buffer di uchar)
+kernel void imginit_buf(global uchar4 * img)
+{
+	const int j = get_global_id(1);
+	const int i = get_global_id(0);
+	const int size = get_global_size(0);
+
+	img[j*size+i] = (uchar4)(255, 255, 255, 255);
+}
+
+//Versione che salva i dati dell'immagine direttamente in un buffer
+kernel void montecarlo_hit_plot(global int * hits, float leftLimit, float rightLimit, float funcMax,
+	global uchar4 * plot, uint seed1, uint seed2, uint seed3, uint seed4, int plotWidth, int plotHeight){
+	
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x1 = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	float4 x2 = leftLimit+rightLimit-x1;
+	float4 y1 = MWC64XVEC4(&rng, 0, funcMax);
+	float4 y2 = MWC64XVEC4(&rng, 0, funcMax);
+	int4 check1 = -(function(x1) >= y1);
+	int4 check2 = -(function(x2) >= y2);
+
+	int partHits = check1.x + check1.y + check1.z + check1.w
+		+check2.x + check2.y + check2.z + check2.w;
+	atomic_add(hits, partHits);
+	int4 img_x1 = convert_int4(((x1-leftLimit)/(rightLimit-leftLimit))*(plotWidth-1));
+	int4 img_x2 = plotWidth-1 - img_x1;
+	int4 img_y1 = convert_int4(plotHeight-1 - ((y1*(plotHeight-1)/funcMax)));
+	int4 img_y2 = convert_int4(plotHeight-1 - ((y2*(plotHeight-1)/funcMax)));
+	int4 index1 = img_y1*plotWidth+img_x1;
+	int4 index2 = img_y2*plotWidth+img_x2;
+	uchar4 red = (uchar4)(255, 0, 0, 255);
+	uchar4 blue = (uchar4)(0, 0, 255, 255);
+	//uchar4 u_check1 = convert_uchar4(check1)+127;	//the MSB is 1 if check1.sx is 1; can't convert between different sizes though
+	//uchar4 u_check2 = convert_uchar4(check2)+127;
+	//Doesn't work with array subscript
+	//plot[img_y1*plotWidth+img_x1] = select(blue, red, check1);
+	//plot[img_y2*plotWidth+img_x2] = select(blue, red, check2);
+	/*
+	uchar4 pixels1 = select(blue, red, u_check1);	//if the MSB of u_check1 is set it assigns red
+	uchar4 pixels2 = select(blue, red, u_check2);
+	plot[index1.x] = pixels1.x;
+	plot[index1.y] = pixels1.y;
+	plot[index1.z] = pixels1.z;
+	plot[index1.w] = pixels1.w;
+	plot[index2.x] = pixels2.x;
+	plot[index2.y] = pixels2.y;
+	plot[index2.z] = pixels2.z;
+	plot[index2.w] = pixels2.w;
+	*/
+	if (check1.x) plot[index1.x] = red;
+	else plot[index1.x] = blue;
+	if (check1.y) plot[index1.y] = red;
+	else plot[index1.y] = blue;
+	if (check1.z) plot[index1.z] = red;
+	else plot[index1.z] = blue;
+	if (check1.w) plot[index1.w] = red;
+	else plot[index1.w] = blue;
+
+	if (check2.x) plot[index2.x] = red;
+	else plot[index2.x] = blue;
+	if (check2.y) plot[index2.y] = red;
+	else plot[index2.y] = blue;
+	if (check2.z) plot[index2.z] = red;
+	else plot[index2.z] = blue;
+	if (check2.w) plot[index2.w] = red;
+	else plot[index2.w] = blue;
+}
+
+//Inizializzazione immagine bianca
+kernel void imginit(write_only image2d_t I)
+{
+	const int r = get_global_id(1);
+	const int c = get_global_id(0);
+
+	const int2 dim = get_image_dim(I);
+
+	write_imagei(I, (int2)(c, r), (int4)(255, 255, 255, 255));
+}
+
+kernel void reduce4_lmem(global float * restrict out,
+	global const float4 * restrict in, local float * lmem, int nquarts)
+{
+	const int gws = get_global_size(0);
+	int i = get_global_id(0);
+	float acc = 0.0f;
+	while (i < nquarts) {
+		float4 v = in[i];
+		acc += (v.x + v.y) + (v.z + v.w);
+		i += gws;
+	}
+	i = get_local_id(0);
+	lmem[i] = acc;
+	int working = get_local_size(0)/2;
+	while (working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if(i < working){
+			acc += lmem[i+working];
+			lmem[i] = acc;
+		}
+		working /= 2;
+	}
+	if (i == 0) out[get_group_id(0)] = acc;
+}
+
+kernel void plotter(global uchar4 * plot, global int * plotData){
+	int i = get_global_id(0);
+	int info1 = plotData[i];
+	int info2 = plotData[i+get_global_size(0)];	//read with stride
+	int index1 = info1>>1;	//shift back
+	int index2 = info2>>1;
+	uchar4 red = (uchar4)(255, 0, 0, 255);
+	uchar4 blue = (uchar4)(0, 0, 255, 255);
+	if (info1 & 1) //True if odd (the check was 1)
+		plot[index1] = red;
+	else plot[index1] = blue;
+	if (info2 & 1)
+		plot[index2] = red;
+	else plot[index2] = blue;
+	//printf("Check1: %d, check2: %d, index1: %d, index2: %d\n", info1&1, info2&1, index1, index2);
+}
+
+//Algoritmo di sorting parallelo di Giorgio Locicero
+//Fonte: https://github.com/josura/university-sad/tree/master/prog_GPU/miecoseprogmoderna/progettoGPU
+inline int binaryIndexFullPower_corr(char condition,int pivot,global int* find1, int size){
+        int l=0 ,m, r=size-1;
+        while (l<=r ){
+                m = l + ((r - l)>> 1);
+                int confront1 = find1[m];
+                if ((confront1 < pivot)||(condition && confront1 == pivot) )
+                    l = m +1;
+                else
+                    r = m -1;
+        }
+        return  l;
+}
+
+kernel void stable_local_count_sort_vectlmemV3(global int4 * restrict arr,int nels, global int* restrict res,local int4 * lmem){
+	const int gi= get_global_id(0);
+	const int group_id = get_group_id(0);
+	int pivot;
+	const int li=get_local_id(0);
+	const int lws=get_local_size(0);
+	const int first_el = group_id*lws;
+	const int reading_quarts=(group_id == nels/lws ? (nels-(nels/lws)*lws)>>2 : lws>>2);
+	const int reading_place = (group_id * (lws>>2)) + li;
+	global int* restrict arr_scalar = (global int* )arr;
+	if(gi<nels){
+		pivot = arr_scalar[gi];
+		if(li<reading_quarts){
+			lmem[li] = arr[reading_place];
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+	int counter=0;
+	int4 counter4 = (int4)(0);
+	if(gi<nels){
+		for(int i=0;i<(reading_quarts); i++){
+			const int4 compar = lmem[i];
+			const int4 positions = (int4)(0,1,2,3)+(i<<2)<li;
+			counter4 -= (compar < pivot)|( positions && (compar == pivot));
+
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+	if(gi<nels){
+		counter=counter4.s0+counter4.s1+counter4.s2+counter4.s3;
+		res[first_el + counter]=pivot;
+	}
+}
+
+kernel void mergebinaryWithRepParallelV4(global int * out ,global int* arr,int nels, int subsize ){
+    const int gi = get_global_id(0);
+	if(gi>=nels)return;
+	const int subsetid = gi/subsize;
+	int start,end,index;
+	const int pivot = arr[gi];
+	char condition = subsetid & 1;
+	//start = condition ? (subsetid - 1) * subsize: (subsetid + 1) * subsize;
+
+    start = (gi-(gi &(subsize-1)))^subsize; 	
+
+	start = (gi-(gi &(subsize-1)))^subsize; 
+
+	end = (start + subsize) < nels ? start + subsize : nels;
+	int locindex=0;
+	//if(start<nels) 
+	locindex = binaryIndexFullPower_corr(condition,pivot,arr + start , end - start);
+	index=(gi-(condition ? subsize : 0))+locindex;
+	out[index] = pivot;
+	
+}
+
+
+

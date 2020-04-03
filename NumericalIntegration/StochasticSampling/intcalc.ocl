@@ -1,0 +1,389 @@
+//Function to integrate
+inline float4 function(float4 x){
+	return 
+		sqrt(1-x*x);
+}
+
+inline float function1(float x){
+	return 
+		sqrt(1-x*x);
+}
+
+inline float2 function2(float2 x){
+	return 
+		sqrt(1-x*x);
+}
+
+inline float function4D(float x, float y, float z){
+	return 
+		x*x + y*y + z*z;
+}
+
+//MWC64x, an RNG made by David B. Tomas
+//Source: http://cas.ee.ic.ac.uk/people/dt10/research/rngs-gpu-mwc64x.html
+
+typedef struct{ uint4 x; uint4 c; } mwc64xvec4_state_t;
+
+enum{ MWC64XVEC4_A = 4294883355U };
+enum{ MWC64XVEC4_M = 18446383549859758079UL };
+
+//! Represents the state of a particular generator
+typedef struct{ uint x; uint c; } mwc64x_state_t;
+
+inline float4 MWC64XVEC4(mwc64xvec4_state_t *s, float leftLimit, float rightLimit)
+{
+    enum{ MWC64XVEC4_A = 4294883355U };
+    uint4 x=s->x, c=s->c;
+    uint4 res=x^c;                     // Calculate the result
+    uint4 hi=mul_hi(x,MWC64XVEC4_A);              // Step the RNG
+    x=x*MWC64XVEC4_A+c;
+    c=hi+convert_uint4(x<c);
+    s->x=x;
+    s->c=c;             // Pack the state back up
+    return leftLimit + convert_float4(res)*((rightLimit - leftLimit)/4294967295);
+}
+
+inline uint randomizeId(uint id)
+{
+        id = (id ^ 61) ^ (id >> 16);
+        id *= 9;
+        id = id ^ (id >> 4);
+        id *= 0x27d4eb2d;
+        id = id ^ (id >> 15);
+        return id;
+ }
+
+inline void MWC64XVEC4_Seeding(mwc64xvec4_state_t *s, uint seed1, uint seed2, uint seed3, uint seed4){
+	const int gi = get_global_id(0) + 1;
+	const int li = get_local_id(0) + 1;
+	s->x = (uint4)((seed1) ^ randomizeId(gi&li), (seed2*seed3) ^ randomizeId(gi&li), (seed2*(seed4 & 131071)) ^ randomizeId(gi+li), ((seed1 & 131071)*seed2) ^ randomizeId(gi+li));
+	s->c = (uint4)((seed4) ^ randomizeId(gi+li), (seed4 ^ seed1) ^ randomizeId(gi+li), (seed3*seed1) ^ randomizeId(gi & li), (seed3*(seed4 & 131071)) ^ randomizeId(gi & li));
+}
+
+enum{ MWC64X_A = 4294883355U };
+enum{ MWC64X_M = 18446383549859758079UL };
+
+// Pre: a<M, b<M
+// Post: r=(a+b) mod M
+ulong MWC_AddMod64(ulong a, ulong b, ulong M)
+{
+	ulong v=a+b;
+	if( (v>=M) || (v<a) )
+		v=v-M;
+	return v;
+}
+
+// Pre: a<M,b<M
+// Post: r=(a*b) mod M
+// This could be done more efficently, but it is portable, and should
+// be easy to understand. It can be replaced with any of the better
+// modular multiplication algorithms (for example if you know you have
+// double precision available or something).
+ulong MWC_MulMod64(ulong a, ulong b, ulong M)
+{	
+	ulong r=0;
+	while(a!=0){
+		if(a&1)
+			r=MWC_AddMod64(r,b,M);
+		b=MWC_AddMod64(b,b,M);
+		a=a>>1;
+	}
+	return r;
+}
+
+
+// Pre: a<M, e>=0
+// Post: r=(a^b) mod M
+// This takes at most ~64^2 modular additions, so probably about 2^15 or so instructions on
+// most architectures
+ulong MWC_PowMod64(ulong a, ulong e, ulong M)
+{
+	ulong sqr=a, acc=1;
+	while(e!=0){
+		if(e&1)
+			acc=MWC_MulMod64(acc,sqr,M);
+		sqr=MWC_MulMod64(sqr,sqr,M);
+		e=e>>1;
+	}
+	return acc;
+}
+
+uint2 MWC_SkipImpl_Mod64(uint2 curr, ulong A, ulong M, ulong distance)
+{
+	ulong m=MWC_PowMod64(A, distance, M);
+	ulong x=curr.x*(ulong)A+curr.y;
+	x=MWC_MulMod64(x, m, M);
+	return (uint2)((uint)(x/A), (uint)(x%A));
+}
+
+uint2 MWC_SeedImpl_Mod64(ulong A, ulong M, uint vecSize, uint vecOffset, ulong streamBase, ulong streamGap)
+{
+	// This is an arbitrary constant for starting LCG jumping from. I didn't
+	// want to start from 1, as then you end up with the two or three first values
+	// being a bit poor in ones - once you've decided that, one constant is as
+	// good as any another. There is no deep mathematical reason for it, I just
+	// generated a random number.
+	enum{ MWC_BASEID = 4077358422479273989UL };
+	
+	ulong dist=streamBase + (get_global_id(0)*vecSize+vecOffset)*streamGap;
+	ulong m=MWC_PowMod64(A, dist, M);
+	
+	ulong x=MWC_MulMod64(MWC_BASEID, m, M);
+	return (uint2)((uint)(x/A), (uint)(x%A));
+}
+
+void MWC64XVEC4_SeedStreams(mwc64xvec4_state_t *s, ulong baseOffset, ulong perStreamOffset)
+{
+	uint2 tmp0=MWC_SeedImpl_Mod64(MWC64XVEC4_A, MWC64XVEC4_M, 4, 0, baseOffset, perStreamOffset);
+	uint2 tmp1=MWC_SeedImpl_Mod64(MWC64XVEC4_A, MWC64XVEC4_M, 4, 1, baseOffset, perStreamOffset);
+	uint2 tmp2=MWC_SeedImpl_Mod64(MWC64XVEC4_A, MWC64XVEC4_M, 4, 2, baseOffset, perStreamOffset);
+	uint2 tmp3=MWC_SeedImpl_Mod64(MWC64XVEC4_A, MWC64XVEC4_M, 4, 3, baseOffset, perStreamOffset);
+	s->x=(uint4)(tmp0.x, tmp1.x, tmp2.x, tmp3.x);
+	s->c=(uint4)(tmp0.y, tmp1.y, tmp2.y, tmp3.y);
+}
+
+void MWC64XVEC4_Step(mwc64xvec4_state_t *s)
+{
+	uint4 X=s->x, C=s->c;
+	
+	uint4 Xn=MWC64XVEC4_A*X+C;
+	// Note that vector comparisons return -1 for true, so we have to do this odd negation
+	// I would hope that the compiler would do something sensible if possible...
+	uint4 carry=as_uint4(-(Xn<C));		
+	uint4 Cn=mad_hi((uint4)MWC64XVEC4_A,X,carry);
+	
+	s->x=Xn;
+	s->c=Cn;
+}
+
+uint4 MWC64XVEC4_NextUint4(mwc64xvec4_state_t *s)
+{
+	uint4 res=s->x ^ s->c;
+	MWC64XVEC4_Step(s);
+	return res;
+}
+
+float4 MWC64XVEC4_NextRangedFloat4(mwc64xvec4_state_t *s, float leftLimit, float rightLimit)
+{
+	uint4 res=s->x ^ s->c;
+	uint MaxValue = 4294967295;
+	MWC64XVEC4_Step(s);
+	return leftLimit + convert_float4(res)*((rightLimit - leftLimit)/MaxValue);
+}
+
+kernel void vecinit_rect(global float4 * v, float leftLimit, float rightLimit, 
+	uint seed1, uint seed2, uint seed3, uint seed4){
+
+	const int i = get_global_id(0);
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x1 = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	float4 x2 = leftLimit+rightLimit-x1;
+	v[i]=x1;
+	v[(i+get_global_size(0))]=x2;
+
+}
+
+kernel void intcalc_randrect(global float * v1, global float * v2){
+
+	const int i = get_global_id(0);
+	float x1 = v1[i];
+	float x2 = v1[i+1];
+	v2[i] = function1(x1)*(x2-x1);
+	//printf("Wi %d, x1: %f, x2: %f, result: %f\n", i, x1, x2, v2[i]);
+	if(i==get_global_size(0)-1) v2[i+1] = 0.0f;	//the last work-item should erase this position or it will alter the sum reduction
+
+}
+
+//each rectangle has the same base, basically sample-mean
+kernel void intcalc_randrectB(global float4 * v, float leftLimit, float rightLimit, 
+	uint seed1, uint seed2, uint seed3, uint seed4){
+
+	const int i = get_global_id(0);
+	mwc64xvec4_state_t rng;
+	MWC64XVEC4_Seeding(&rng, seed1, seed2, seed3, seed4);
+	float4 x1 = MWC64XVEC4(&rng, leftLimit, rightLimit);
+	v[i] = function(x1)+function(leftLimit+rightLimit-x1);
+	//printf("Wi %d, %f, %f, %f, %f\n", i, res.x, res.y, res.z, res.w);
+
+}
+
+kernel void print(global float * v1, global float * v2){
+
+	const int i = get_global_id(0);
+	float x1 = v1[i];
+	printf("Wi %d, x1: %f, result: %f\n", i, x1, v1[i]);
+}
+
+kernel void intcalc_randrect_lmem(global float * v1, global float * v2, local volatile float * cache, int nsamples){
+
+	const int gi = get_global_id(0);
+	if(gi>=nsamples-1) return;
+	const int li =get_local_id(0);
+	float x1 = v1[gi];
+	//printf("Wi %d, prelevato x1: %f\n", gi, x1);
+	float x2;
+	float f = function1(x1);
+	cache[li] = x1;
+	barrier(CLK_LOCAL_MEM_FENCE);
+
+	x2 = (li < get_local_size(0) - 1 && gi != nsamples-2 ? cache[li+1] : v1[gi+1]);
+	v2[gi] = f*(x2-x1);
+	//printf("Wi %d, x1: %f, x2: %f, result: %f\n", gi, x1, x2, v2[gi]);
+	if(gi==nsamples-2) v2[gi+1] = 0.0f;	//the last work-item should erase this position or it will alter the sum reduction
+
+}
+
+kernel void intcalc_randrect4(global float4 * v1, global float4 * v2){
+
+	const int i = get_global_id(0);
+	float4 x1 = v1[i];
+	float x2;
+	if(i==get_global_size(0)-1) x2 = x1.w;	//last work-item should deal with three areas, so we can just put a dummy area (the interval will be zero)
+	else x2 = v1[i+1].s0;
+	float4 intervals = (float4)(x1.s1-x1.s0, x1.s2-x1.s1, x1.s3-x1.s2, x2-x1.s3);
+	v2[i] = function(x1)*intervals;
+	//printf("Wi %d, x1: %f, x2: %f, fun: %f\n", i, x1, x2, function(x1));
+
+}
+
+kernel void intcalc_randhyperrect(global float * vX, global float * vY, global float * vZ, global float * hypervolumes){
+
+	const int i = get_global_id(0);
+	const int j = get_global_id(1);
+	const int k = get_global_id(2);
+	const int size = get_global_size(1);
+	float x1 = vX[i];
+	float y1 = vY[j];
+	float z1 = vZ[k];
+
+	float x2 = vX[i+1];
+	float y2 = vY[j+1];
+	float z2 = vZ[k+1];
+	
+	hypervolumes[k*size*size+j*size+i]=function4D(x1, y1, z1)*(x2-x1)*(y2-y1)*(z2-z1);
+	//printf("Wi (%d, %d, %d), x1=%f, x2=%f, y1=%f, y2=%f, z1=%f, z2=%f, res=%f\n", i, j, k, x1, x2, y1, y2, z1, z2, res);
+
+}
+
+//Sum reduction with local memory
+kernel void reduce4_lmem(global float * restrict out,
+	global const float4 * restrict in, local float * lmem, int nquarts)
+{
+	int i = get_global_id(0);
+	const int gws = get_global_size(0);
+	float acc = 0.0f;
+	while (i < nquarts) {
+		float4 v = in[i];
+		//printf("Wi %d, v = %f, %f, %f, %f\n", i, v.x, v.y, v.z, v.w);
+		acc += (v.x + v.y) + (v.z + v.w);
+		i += gws;
+	}
+	i = get_local_id(0);
+	lmem[i] = acc;
+	int working = get_local_size(0)/2;
+	while (working > 0){
+		barrier(CLK_LOCAL_MEM_FENCE);
+		if(i < working){
+			acc += lmem[i+working];
+			lmem[i] = acc;
+		}
+		working /= 2;
+	}
+	if (i == 0){
+		out[get_group_id(0)] = acc;
+	}
+}
+
+
+//ParallelMerge GPU sorting
+inline int binaryIndexFullPower_corr(char condition,float pivot,global float* find1, int size){
+        int l=0 ,m, r=size-1;
+        while (l<=r ){
+                m = l + ((r - l)>> 1);
+                float confront1 = find1[m];
+                if ((confront1 < pivot)||(condition && confront1 == pivot) )
+                    l = m +1;
+                else
+                    r = m -1;
+        }
+        return  l;
+}
+
+inline int local_binaryIndexFullPower_corr(char condition,float pivot,local float* find1, int size){
+        int l=0 ,m, r=size-1;
+        while (l<=r ){
+                m = l + ((r - l)>> 1);
+                float confront1 = find1[m];
+                if ((confront1 < pivot)||(condition && confront1 == pivot) )
+                    l = m +1;
+                else
+                    r = m -1;
+        }
+        return  l;
+}
+
+kernel void ParallelMerge_Local(global const float * in,int nels,global float * out,local float * lmem)
+{
+	const int li = get_local_id(0);
+	int wg = get_local_size(0);
+	const int gi = get_global_id(0);
+	// Move to the start of the subarray
+	int offset = get_group_id(0) * wg;
+	// see if we are at the end of the array
+	wg = (offset+wg)<nels ? wg : nels - offset; 
+	in += offset; out += offset;
+
+	//loading in local memory
+	if(li<wg)
+	lmem[li] = in[li];
+	barrier(CLK_LOCAL_MEM_FENCE); 
+
+	  // merging sub-sequences of length 1,2,...,WG/2
+	for (int length=1;length<wg;length<<=1)
+	{
+		float pivot = lmem[li];
+		int ii = li & (length-1);  // index in our sequence in 0..length-1
+		int sibling = (li - ii) ^ length; // beginning of the sibling to find the position
+		int pos = 0;
+		pos = local_binaryIndexFullPower_corr((sibling/length)&1,pivot,lmem+sibling , length);
+		/* for (int inc=length;inc>0;inc>>=1) // binary search in the sub-sequence
+		{
+			int j = sibling+pos+inc-1;
+			float confront2 = (j<wg ?  lmem[j] : FLT_MAX);
+			bool smaller = (confront2 < pivot) || ( confront2 == pivot && j < li );
+			pos += (smaller)?inc:0;
+			pos = min(pos,length);
+		} */
+		int bits = (length<<1)-1; // mask for destination
+		int dest = ((ii + pos) & bits) | (li & ~bits); // destination index in merged sequence
+		barrier(CLK_LOCAL_MEM_FENCE);
+		lmem[dest] = pivot;
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+
+  // Write output
+  	if(li<wg)
+	out[li] = lmem[li];
+}
+
+kernel void mergebinaryWithRepParallelV4(global float * out ,global float* arr,int nels, int subsize ){
+    const int gi = get_global_id(0);
+	if(gi>=nels)return;
+	const int subsetid = gi/subsize;
+	int start,end,index;
+	const float pivot = arr[gi];
+	char condition = subsetid & 1;
+	//start = condition ? (subsetid - 1) * subsize: (subsetid + 1) * subsize;
+
+    start = (gi-(gi &(subsize-1)))^subsize; 	
+
+	end = (start + subsize) < nels ? start + subsize : nels;
+	int locindex=0;
+	//if(start<nels) 
+	locindex = binaryIndexFullPower_corr(condition,pivot,arr + start , end - start);
+	index=(gi-(condition ? subsize : 0))+locindex;
+	out[index] = pivot;
+	
+}
+

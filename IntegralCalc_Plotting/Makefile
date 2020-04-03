@@ -1,0 +1,6 @@
+LDLIBS=-lm -lOpenCL -Wall
+#LDLIBS=-framework OpenCL
+
+TARGETS = integralcalc_hit  integralcalc_hit_plot   integralcalc_hit_plot4   integralcalc_hit_image  integralcalc_hit_sort  integralcalc_mean_plot
+
+all: $(TARGETS)
