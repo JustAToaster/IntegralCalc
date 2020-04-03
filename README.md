@@ -26,3 +26,10 @@ The methods used were:
 - Trapezoid rule
 - Simpson Rule
 - Rectangle rule with random rectangles (and antithetic variates)
+
+## License
+IntegralCalc is released as GPLv3
+
+## Credits
+- David B. Tomas for the MWC64X GPU RNG
+- Josura for GPU sorting
