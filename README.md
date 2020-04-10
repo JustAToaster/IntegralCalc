@@ -1,5 +1,5 @@
 # IntegralCalc
-Definite integration on GPU (up to triple integrals). Made as a GPU programming project for University.
+Definite integration on GPU (up to triple integrals) with OpenCL 1.2. Made as a GPU programming project for University.
 ## Compiling
 For Linux, install the OpenCL SDK:
 
@@ -21,13 +21,15 @@ You can see the plots in pam format with imageMagick:
 
 **sudo apt-get install imagemagick**
 
+You can display plots with **display plot.pam** and **display plotMean.pam**.
+
 ## Integration methods
 The methods used were:
 - Monte Carlo Sample-Mean (with antithetic variates)
 - Monte Carlo Hit or Miss (with antithetic variates)
 - Rectangle rule
 - Trapezoid rule
-- Simpson Rule
+- Simpson's Rule
 - Rectangle rule with random rectangles (and antithetic variates)
 
 ## License
